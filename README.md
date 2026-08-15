@@ -3,12 +3,44 @@
 Desktop app that combines selected photos into one or more PDFs:
 
 - Choose a **single file**, **multiple files**, or a **whole folder**
-- Folder mode picks only image extensions (jpg, jpeg, png, webp, bmp, tif, tiff)
-- Images are **sorted by date created**, then grouped into PDFs of at most **20** pages
-- Extra images spill into the next PDF (`images_part_01.pdf`, `images_part_02.pdf`, …)
-- PDFs are written into the **source folder** itself
-- Each PDF is kept under a size limit (default **10 MB**) by **compressing** JPEG and PNG (dimensions stay the same). If it still does not fit, fewer images go into that PDF.
+- Folder mode picks image extensions (jpg, jpeg, png, webp, bmp, tif, tiff) **and PDFs**
+- **Existing PDFs can be included**: every page of a selected PDF becomes a page of the output (see below)
+- Files are **sorted by date created**, then grouped into PDFs of at most **20** pages
+- Extra pages spill into the next PDF (`images_part_01.pdf`, `images_part_02.pdf`, …)
+- PDFs are written into a **`rocket_pdf_output` folder created inside the source folder**
+- Each PDF is kept under a size limit (default **10 MB**) by **compressing** JPEG and PNG (dimensions stay the same). If it still does not fit, fewer pages go into that PDF.
 - Optional **Scan documents** mode turns phone photos of paper into scan-like pages: auto-crop to the document, perspective + skew correction, shadow removal
+
+---
+
+## Including existing PDFs
+
+PDFs can sit in the selection next to photos — pick them with **Add File(s)**, or
+just choose a folder and every PDF in it is selected along with the images.
+
+Each page of a selected PDF is **rendered to an image** (150 dpi, via PDFium)
+before packing. That is what keeps one promise intact: the size limit still
+applies to the final PDF, because rendered pages go through the same compression
+ladder as the photos, and are moved to the next part file when a part will not
+fit. Text-ish pages are kept lossless (PNG); pages that are really photographs go
+out as high-quality JPEG.
+
+Two consequences worth knowing:
+
+- Text in an included PDF becomes **image text** — not selectable, not searchable.
+- **Scan documents** never runs on PDF pages (they are already flat scans, so
+  boundary detection could only damage them). Photos in the same batch are still
+  scanned normally.
+
+A PDF that cannot be opened (corrupt or password-protected) is skipped with a
+warning; the rest of the batch still converts.
+
+**Requirement:** this needs `pypdfium2`. It is in `requirements.txt`; if it is
+missing, PDFs are refused at selection time and image conversion still works.
+
+```bash
+pip install pypdfium2
+```
 
 ---
 
@@ -40,6 +72,31 @@ document-scanner pipeline first (OpenCV — no cloud, no model downloads):
    capped gain.
 
 Roughly 0.6 s for a 2 MP photo, 1.8 s for a 7 MP one.
+
+**AI detection (default on)**
+
+The boundary is located by a CNN first — U²-Net (4.6 MB, Apache-2.0), run through
+**OpenCV's own DNN module**, so there is no extra Python dependency (`onnxruntime`
+has no wheels for recent Python versions). Inference is ~0.2 s per photo on CPU
+and entirely local: nothing is uploaded.
+
+The model's mask is coarse, so it is never used as the crop directly — it feeds
+the same candidate/evidence machinery described above. The classical detector
+takes over whenever the model is missing, fails to download, or produces
+something unconvincing, and the crop-preview outline labels which one ran
+(`[ai]` or `[classic]`).
+
+The weights download once, on first use, into `~/.img2pdf/models/` (override with
+`IMG2PDF_MODEL_DIR`), verified against a pinned SHA-256. To pre-install them —
+or to bundle them into the `.exe` so it works offline — drop the file at
+`models/u2netp.onnx`:
+
+```bash
+mkdir -p models && curl -L -o models/u2netp.onnx \
+  https://github.com/danielgatis/rembg/releases/download/v0.0.0/u2netp.onnx
+```
+
+Untick **AI detection** in the UI to force the classical detector.
 
 **Modes**
 
@@ -172,14 +229,14 @@ Or: `python run_app.py`
 ## Usage
 
 1. Click **Add File**, **Add Files**, or **Add Folder**.
-2. Folder selection loads only image files from that folder (non-recursive) and replaces the list.
+2. Folder selection loads the images **and PDFs** from that folder (non-recursive) and replaces the list.
 3. The list is shown sorted by date created (oldest first) — that same order is used for PDF grouping.
-4. Set **Max images / PDF** and **Max PDF size (MB)** if needed.
+4. Set **Max pages / PDF** and **Max PDF size (MB)** if needed. A selected PDF counts as one page per page it contains.
 5. Tick **Scan documents** (and pick a mode) to auto-crop/deskew photos of paper.
 6. Optionally click **Crop preview** first to check the crop in a `temp_crop` folder.
-7. Click **Convert**. Output PDFs are saved next to the source images.
+7. Click **Convert**. Output PDFs are saved in a `rocket_pdf_output` folder inside the source folder, which opens when the run finishes.
 
-If even one image at maximum compression is still over the size limit, that PDF is written anyway and a warning is shown.
+If even one page at maximum compression is still over the size limit, that PDF is written anyway and a warning is shown.
 
 ## Project layout
 
@@ -188,7 +245,9 @@ app/
   main.py              # CustomTkinter UI
   converter.py         # Created-date sort, compress-then-split packing, PDF writer
   compression.py       # ImageCompressor interface + JPEG/PNG (MozJPEG, oxipng)
+  pdf_pages.py         # Renders pages of a selected PDF to images (PDFium)
   scanner.py           # Document scanner: background model, evidence-scored crop, deskew, clean up
+  ai_detector.py       # Optional U^2-Net segmentation via cv2.dnn (downloads weights once)
   config.py            # Defaults
 run_app.py             # App entry (used by the .exe)
 build_windows.bat      # Double-click on Windows to build Img2PDF.exe
@@ -201,12 +260,13 @@ requirements-build.txt
 
 | Setting | Default |
 |---------|---------|
-| Max images / PDF | 20 |
+| Max pages / PDF | 20 |
 | Max PDF size | 10 MB |
-| Folder scan | Non-recursive, image extensions only |
+| Folder scan | Non-recursive, image extensions + `.pdf` |
 | Grouping order | Date created (oldest first) |
-| Output location | Source folder of selected images |
-| Size strategy | Compress JPEG/PNG first (no resize); if still over limit, fewer images per PDF |
+| Output location | `rocket_pdf_output/` inside the source folder |
+| PDF page rendering | 150 dpi |
+| Size strategy | Compress JPEG/PNG first (no resize); if still over limit, fewer pages per PDF |
 
 ## JPEG and PNG compression
 
@@ -229,5 +289,6 @@ Both formats are compressed **on your machine** (no uploads). Pixel size is not 
 These are typical ranges, not guarantees. A JPEG that is already small (WhatsApp, social apps) may barely shrink until quality is dropped a lot. If the PDF is still over the limit after quality 45, the app puts fewer images in that PDF.
 | Scan documents | Off |
 | Scan mode | `auto` (colour unless the page is plain ink on paper) |
+| AI detection | On (falls back to classical when unsure or offline) |
 | Crop preview output | `temp_crop/` inside the source folder |
 | Max deskew angle | 15 deg |

@@ -6,6 +6,8 @@ dist/
 build/
 tmp_test_images/
 tmp_test_output/
+# Downloaded model weights (fetched on first use, see README)
+models/
 # Local test photos (may contain personal documents) and crop-preview output
 samples/
 temp_crop/

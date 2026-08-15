@@ -2,6 +2,8 @@
 # Build on Windows: double-click build_windows.bat
 #   or: pyinstaller --noconfirm Img2PDF.spec
 
+from pathlib import Path
+
 from PyInstaller.utils.hooks import collect_all
 
 datas = []
@@ -10,10 +12,18 @@ binaries = []
 # binaries, they just need to be named because the import is inside a try block.
 hiddenimports = ["PIL._tkinter_finder", "cv2", "numpy"]
 
-tmp_ret = collect_all("customtkinter")
-datas += tmp_ret[0]
-binaries += tmp_ret[1]
-hiddenimports += tmp_ret[2]
+for package in ("customtkinter", "pypdfium2", "pypdfium2_raw"):
+    # pypdfium2 ships the PDFium shared library as package data, so a plain
+    # hiddenimport is not enough — the binary has to come along too.
+    tmp_ret = collect_all(package)
+    datas += tmp_ret[0]
+    binaries += tmp_ret[1]
+    hiddenimports += tmp_ret[2]
+
+# Bundle the document model when it is present, so the .exe needs no download.
+_model = Path("models/u2netp.onnx")
+if _model.is_file():
+    datas += [(str(_model), ".")]
 
 a = Analysis(
     ["run_app.py"],

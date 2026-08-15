@@ -17,6 +17,14 @@ IMAGE_EXTENSIONS = {
     ".tiff",
 }
 
+# PDF files can be selected too: their pages are rendered to images and packed
+# alongside the photos, so the size limit still applies to the final PDF.
+PDF_EXTENSIONS = {".pdf"}
+SUPPORTED_EXTENSIONS = IMAGE_EXTENSIONS | PDF_EXTENSIONS
+# Rasterisation resolution for those pages (higher = sharper but heavier)
+PDF_RENDER_DPI = 150
+PDF_RENDER_JPEG_QUALITY = 95
+
 # JPEG quality compressor (dimensions are never changed)
 INITIAL_JPEG_QUALITY = 85
 MIN_JPEG_QUALITY = 40
@@ -25,6 +33,10 @@ QUALITY_STEP = 10
 # Document scanner (auto-crop / deskew / scanned look)
 DEFAULT_SCAN_ENABLED = False
 DEFAULT_SCAN_MODE = "auto"  # auto | color | gray | bw
+# AI document segmentation (U^2-Net via OpenCV DNN). Falls back to the
+# classical detector whenever the model is missing or unconvincing.
+DEFAULT_SCAN_USE_AI = True
+SCAN_AI_MASK_THRESHOLD = 0.5
 # Boundary detection runs on a copy scaled to this long edge (speed + stability)
 SCAN_DETECT_LONG_EDGE_PX = 1000
 # A detected page must cover at least this fraction of the frame to be trusted
@@ -59,9 +71,10 @@ SCAN_INTERMEDIATE_JPEG_QUALITY = 95
 # Folder (inside the source folder) for the "Crop preview" button's output
 SCAN_PREVIEW_DIR_NAME = "temp_crop"
 
-# Output naming (written into the source folder)
+# Output: a folder created inside the source folder, and the file names in it
+OUTPUT_DIR_NAME = "rocket_pdf_output"
 OUTPUT_NAME_PATTERN = "images_part_{part:02d}.pdf"
 
 # UI
 APP_TITLE = "Image to PDF"
-WINDOW_SIZE = "720x560"
+WINDOW_SIZE = "900x680"

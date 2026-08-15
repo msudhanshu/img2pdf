@@ -1,4 +1,4 @@
-"""Chunk images into PDFs with compression, then fewer pages if needed."""
+"""Chunk images (and pages of selected PDFs) into PDFs with compression."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Callable, Iterator
 
 import img2pdf
 
-from app import config
+from app import config, pdf_pages
 from app.compression import ImageCompressor, default_compressor
 from app.scanner import ScanOptions, scan_file, scan_file_detailed
 
@@ -31,6 +31,15 @@ def is_image_path(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in config.IMAGE_EXTENSIONS
 
 
+def is_pdf_path(path: Path) -> bool:
+    return path.is_file() and path.suffix.lower() in config.PDF_EXTENSIONS
+
+
+def is_supported_path(path: Path) -> bool:
+    """Images and PDFs are both valid input."""
+    return path.is_file() and path.suffix.lower() in config.SUPPORTED_EXTENSIONS
+
+
 def file_created_time(path: Path) -> float:
     """Creation time when available (Windows st_ctime / macOS st_birthtime)."""
     stat = path.stat()
@@ -42,37 +51,47 @@ def sort_by_created(paths: list[Path]) -> list[Path]:
     return sorted(paths, key=lambda p: (file_created_time(p), p.name.lower()))
 
 
-def collect_images_from_folder(folder: Path) -> list[Path]:
-    """Non-recursive listing of image-extension files only, sorted by created date."""
+def collect_sources_from_folder(folder: Path) -> list[Path]:
+    """
+    Non-recursive listing of the images *and* PDFs in a folder, sorted by created date.
+
+    Anything the app itself wrote (the ``rocket_pdf_output`` folder) sits in a
+    subfolder, so re-running on the same folder never picks up its own output.
+    """
     if not folder.is_dir():
         return []
-    images = [p.resolve() for p in folder.iterdir() if is_image_path(p)]
-    return sort_by_created(images)
+    sources = [p.resolve() for p in folder.iterdir() if is_supported_path(p)]
+    return sort_by_created(sources)
 
 
-def normalize_image_paths(paths: list[Path | str]) -> list[Path]:
-    """Keep valid images, drop duplicates, then sort by date created."""
+def normalize_source_paths(paths: list[Path | str]) -> list[Path]:
+    """Keep valid images/PDFs, drop duplicates, then sort by date created."""
     seen: set[Path] = set()
     result: list[Path] = []
     for raw in paths:
         path = Path(raw).expanduser().resolve()
-        if path in seen or not is_image_path(path):
+        if path in seen or not is_supported_path(path):
             continue
         seen.add(path)
         result.append(path)
     return sort_by_created(result)
 
 
-def infer_source_output_dir(paths: list[Path]) -> Path:
-    """Prefer the shared parent folder of selected images (source path)."""
+def infer_source_dir(paths: list[Path]) -> Path:
+    """The shared parent folder of the selected files (source path)."""
     if not paths:
-        raise ValueError("No image paths provided.")
+        raise ValueError("No source paths provided.")
     parents = [p.parent.resolve() for p in paths]
     counts: dict[Path, int] = {}
     for parent in parents:
         counts[parent] = counts.get(parent, 0) + 1
     # Most common parent; ties broken by path string for stability
     return max(counts.items(), key=lambda item: (item[1], str(item[0])))[0]
+
+
+def resolve_output_dir(paths: list[Path]) -> Path:
+    """Where the finished PDFs go: a folder created inside the source folder."""
+    return infer_source_dir(paths) / config.OUTPUT_DIR_NAME
 
 
 def chunk_paths(paths: list[Path], max_images: int) -> list[list[Path]]:
@@ -88,32 +107,97 @@ def _compressed_pages(
     return [compressor.compress(path) for path in image_paths]
 
 
+@dataclass
+class _Page:
+    """One page on its way into the output PDF."""
+
+    path: Path  # image file to encode (an original, or a rendered PDF page)
+    label: str  # what to call it in progress messages
+    from_pdf: bool = False
+
+
+@contextmanager
+def _expanded_pages(
+    paths: list[Path],
+    report: ProgressCallback,
+    warn: Callable[[str], None],
+) -> Iterator[list[_Page]]:
+    """
+    Yield one ``_Page`` per output page, rendering any selected PDF's pages to images.
+
+    Rasterising up front is what lets a mixed selection share one pipeline: the
+    compression ladder and the size limit then apply to PDF pages exactly as
+    they do to photos.
+    """
+    if not any(is_pdf_path(path) for path in paths):
+        yield [_Page(path, path.name) for path in paths]
+        return
+
+    if not pdf_pages.is_available():
+        raise pdf_pages.PdfRenderUnavailableError(
+            "Including PDFs needs pypdfium2. Install it with:\n    pip install pypdfium2"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="img2pdf_pdfsrc_") as temp_dir:
+        pages: list[_Page] = []
+        for index, path in enumerate(paths, start=1):
+            if not is_pdf_path(path):
+                pages.append(_Page(path, path.name))
+                continue
+
+            report(f"Reading pages from {path.name} ({index}/{len(paths)})...")
+            try:
+                rendered = pdf_pages.render_pdf_pages(
+                    path, temp_dir, f"{index:04d}_{path.stem}"
+                )
+            except Exception as exc:  # noqa: BLE001 - one bad PDF must not fail the run
+                warn(f"Could not read {path.name} ({exc}); skipped.")
+                continue
+
+            if not rendered:
+                warn(f"{path.name} has no pages; skipped.")
+                continue
+
+            report(f"{path.name}: {len(rendered)} page(s) added.")
+            for number, page_path in enumerate(rendered, start=1):
+                pages.append(
+                    _Page(page_path, f"{path.name} p{number}", from_pdf=True)
+                )
+        yield pages
+
+
 @contextmanager
 def _scanned_sources(
-    paths: list[Path],
+    pages: list[_Page],
     scan_options: ScanOptions | None,
     report: ProgressCallback,
 ) -> Iterator[list[Path]]:
     """
-    Yield paths to scanned copies of ``paths`` (auto-cropped, deskewed, cleaned).
+    Yield paths to scanned copies of ``pages`` (auto-cropped, deskewed, cleaned).
 
     Scanning is done once up front and cached in a temp folder, because the
     compression loop re-encodes the same page many times. Order is preserved,
-    and any page that fails to scan falls back to its original file.
+    and any page that fails to scan falls back to its original file. Pages that
+    came from a PDF are passed through untouched — they are already flat scans,
+    so boundary detection could only damage them.
     """
     if scan_options is None or not scan_options.enabled:
-        yield paths
+        yield [page.path for page in pages]
         return
 
     with tempfile.TemporaryDirectory(prefix="img2pdf_scan_") as temp_dir:
         scan_dir = Path(temp_dir)
         scanned: list[Path] = []
-        for index, path in enumerate(paths, start=1):
-            report(f"Scanning {path.name} ({index}/{len(paths)})...")
+        for index, source in enumerate(pages, start=1):
+            path = source.path
+            if source.from_pdf:
+                scanned.append(path)
+                continue
+            report(f"Scanning {source.label} ({index}/{len(pages)})...")
             try:
                 page = scan_file(path, scan_options)
             except Exception as exc:  # noqa: BLE001 - one bad page must not fail the run
-                report(f"Could not scan {path.name} ({exc}); using the original.")
+                report(f"Could not scan {source.label} ({exc}); using the original.")
                 scanned.append(path)
                 continue
 
@@ -160,7 +244,7 @@ def export_crop_previews(
     * ``<name>_2_crop.jpg``    – cropped and deskewed, original pixels otherwise
     * ``<name>_3_scan.jpg``    – the final cleaned-up page as it would enter the PDF
     """
-    paths = normalize_image_paths(list(image_paths))
+    paths = [p for p in normalize_source_paths(list(image_paths)) if is_image_path(p)]
     if not paths:
         raise ValueError("No valid image files selected.")
 
@@ -174,7 +258,7 @@ def export_crop_previews(
     )
 
     if output_dir is None:
-        out_dir = infer_source_output_dir(paths) / config.SCAN_PREVIEW_DIR_NAME
+        out_dir = infer_source_dir(paths) / config.SCAN_PREVIEW_DIR_NAME
     else:
         out_dir = Path(output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -241,21 +325,26 @@ def convert_images_to_pdfs(
     scan_options: ScanOptions | None = None,
 ) -> ConvertResult:
     """
-    Convert selected images into one or more size-capped PDFs.
+    Convert selected images and PDFs into one or more size-capped PDFs.
 
-    Images are sorted by date created. When ``scan_options`` is enabled each
-    photo is first auto-cropped to the document boundary, deskewed and cleaned
-    up to look scanned. Each PDF then starts with up to ``max_images_per_pdf``
-    pages. Compression is tried first (original dimensions kept). If the PDF is
-    still over the size limit at maximum compression, the last image is moved
-    to the next PDF and the loop repeats.
+    Sources are sorted by date created; a selected PDF contributes one page per
+    page it contains, rendered to an image first. When ``scan_options`` is
+    enabled each *photo* is auto-cropped to the document boundary, deskewed and
+    cleaned up to look scanned (pages that came from a PDF are left alone).
+    Each output PDF then takes up to ``max_images_per_pdf`` pages. Compression
+    is tried first (original dimensions kept). If the PDF is still over the size
+    limit at maximum compression, the last page is moved to the next PDF and the
+    loop repeats.
+
+    ``output_dir`` defaults to a ``rocket_pdf_output`` folder created inside the
+    source folder.
     """
-    paths = normalize_image_paths(list(image_paths))
+    paths = normalize_source_paths(list(image_paths))
     if not paths:
-        raise ValueError("No valid image files selected.")
+        raise ValueError("No valid image or PDF files selected.")
 
     if output_dir is None:
-        out_dir = infer_source_output_dir(paths)
+        out_dir = resolve_output_dir(paths)
     else:
         out_dir = Path(output_dir).expanduser().resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -266,26 +355,34 @@ def convert_images_to_pdfs(
         raise ValueError("max_images_per_pdf must be at least 1.")
 
     compressor = compressor or default_compressor()
-    result = ConvertResult(image_count=len(paths))
+    result = ConvertResult()
 
     def report(message: str) -> None:
         if progress:
             progress(message)
 
+    def warn(message: str) -> None:
+        report(message)
+        result.warnings.append(message)
+
     report(
-        f"Converting {len(paths)} image(s) (grouped by date created) → {out_dir}"
+        f"Converting {len(paths)} file(s) (grouped by date created) → {out_dir}"
     )
 
-    with _scanned_sources(paths, scan_options, report) as sources:
-        _pack_into_pdfs(
-            sources=sources,
-            out_dir=out_dir,
-            max_images_per_pdf=max_images_per_pdf,
-            max_bytes=max_bytes,
-            compressor=compressor,
-            report=report,
-            result=result,
-        )
+    with _expanded_pages(paths, report, warn) as pages:
+        if not pages:
+            raise ValueError("Nothing left to convert (no readable pages).")
+        result.image_count = len(pages)
+        with _scanned_sources(pages, scan_options, report) as sources:
+            _pack_into_pdfs(
+                sources=sources,
+                out_dir=out_dir,
+                max_images_per_pdf=max_images_per_pdf,
+                max_bytes=max_bytes,
+                compressor=compressor,
+                report=report,
+                result=result,
+            )
 
     result.pdf_count = len(result.output_paths)
     report("Done.")

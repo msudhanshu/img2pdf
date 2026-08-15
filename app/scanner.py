@@ -53,6 +53,7 @@ class ScanOptions:
 
     enabled: bool = config.DEFAULT_SCAN_ENABLED
     mode: str = config.DEFAULT_SCAN_MODE
+    use_ai: bool = config.DEFAULT_SCAN_USE_AI
     auto_crop: bool = True
     deskew: bool = True
     sharpen: bool = True
@@ -293,6 +294,12 @@ def _document_mask(bgr: np.ndarray) -> np.ndarray:
     distance = np.sqrt((((lab - median) / spread) ** 2).sum(axis=2))
     mask = (distance > config.SCAN_BACKGROUND_SIGMA).astype(np.uint8) * 255
 
+    return _clean_mask(mask)
+
+
+def _clean_mask(mask: np.ndarray) -> np.ndarray:
+    """Tidy a raw foreground mask: denoise, keep the middle blob, fill its holes."""
+    height, width = mask.shape[:2]
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE, (max(3, width // 100) | 1, max(3, height // 100) | 1)
     )
@@ -319,6 +326,24 @@ def _document_mask(bgr: np.ndarray) -> np.ndarray:
     flood = np.zeros((blob.shape[0] + 2, blob.shape[1] + 2), np.uint8)
     cv2.floodFill(filled, flood, (0, 0), 255)
     return blob | cv2.bitwise_not(filled)
+
+
+def _ai_mask(bgr: np.ndarray, progress=None) -> np.ndarray | None:
+    """Document mask from the CNN, or None when the model cannot be used."""
+    try:
+        from app import ai_detector
+    except ImportError:  # pragma: no cover
+        return None
+    try:
+        mask = ai_detector.segment(bgr, progress=progress)
+    except Exception:  # noqa: BLE001 - any model problem falls back to classical
+        return None
+    cleaned = _clean_mask(mask)
+    coverage = float((cleaned > 0).mean())
+    # A mask covering almost nothing or almost everything tells us nothing.
+    if coverage < config.SCAN_MIN_QUAD_AREA_RATIO or coverage > 0.995:
+        return None
+    return cleaned
 
 
 def _quads_from_contour(contour: np.ndarray) -> list[np.ndarray]:
@@ -382,17 +407,25 @@ def _mask_bounds_quad(mask: np.ndarray) -> np.ndarray | None:
     )
 
 
-def find_document_quad(bgr: np.ndarray) -> np.ndarray | None:
+def find_document_quad(bgr: np.ndarray, use_ai: bool = True) -> np.ndarray | None:
     """
     Find the page corners in a BGR image (top-left, top-right, bottom-right, bottom-left).
 
     Returns None when nothing is trustworthy — the caller then keeps the frame.
     """
-    return _detect(bgr)[0]
+    return _detect(bgr, use_ai)[0]
 
 
-def _detect(bgr: np.ndarray) -> tuple[np.ndarray | None, str, str]:
-    """Detection core. Returns ``(quad_in_full_res, kind, detail)``."""
+def _detect(
+    bgr: np.ndarray, use_ai: bool = True, progress=None
+) -> tuple[np.ndarray | None, str, str]:
+    """
+    Detection core. Returns ``(quad_in_full_res, kind, detail)``.
+
+    The CNN mask is tried first when available; whatever it produces still has
+    to survive the same evidence scoring. If it yields nothing usable, the
+    classical background-model mask is tried in the same way.
+    """
     _require_cv2()
     height, width = bgr.shape[:2]
     scale = config.SCAN_DETECT_LONG_EDGE_PX / float(max(height, width))
@@ -412,27 +445,50 @@ def _detect(bgr: np.ndarray) -> tuple[np.ndarray | None, str, str]:
         cv2.Sobel(blurred, cv2.CV_32F, 0, 1, ksize=3),
     )
 
-    mask = _document_mask(work)
-    best_quad: np.ndarray | None = None
-    best_score = 0.0
-    best_detail = ""
+    sources: list[tuple[str, np.ndarray]] = []
+    if use_ai:
+        ai = _ai_mask(work, progress)
+        if ai is not None:
+            sources.append(("ai", ai))
+    sources.append(("classic", _document_mask(work)))
 
-    for quad in _candidate_quads(work, mask):
-        score, detail = _quad_evidence(quad, gradient, lightness)
-        if score > best_score:
-            best_score, best_quad, best_detail = score, quad, detail
+    fallback: tuple[np.ndarray, str, str] | None = None
 
-    if best_quad is not None:
-        return best_quad / scale, "perspective", best_detail
+    for source_name, mask in sources:
+        best_quad: np.ndarray | None = None
+        best_score = 0.0
+        best_detail = ""
 
-    # No supported quadrilateral: the document probably runs off the frame.
-    # Cropping to the foreground's bounding box is the safe move.
-    bounds = _mask_bounds_quad(mask)
-    if bounds is not None:
-        coverage = cv2.contourArea(bounds) / float(mask.shape[0] * mask.shape[1])
-        if coverage <= config.SCAN_MAX_BOUNDS_COVERAGE:
-            return bounds / scale, "bounds", f"bounding box (cover={coverage:.2f})"
-        return None, "none", "document fills the frame; nothing to crop"
+        for quad in _candidate_quads(work, mask):
+            score, detail = _quad_evidence(quad, gradient, lightness)
+            if score > best_score:
+                best_score, best_quad, best_detail = score, quad, detail
+
+        if best_quad is not None:
+            return best_quad / scale, "perspective", f"[{source_name}] {best_detail}"
+
+        # No supported quadrilateral: the document probably runs off the frame.
+        # Cropping to the foreground's bounding box is the safe move, but a real
+        # boundary from a later source beats it, so hold it back until the end.
+        if fallback is None:
+            bounds = _mask_bounds_quad(mask)
+            if bounds is not None:
+                coverage = cv2.contourArea(bounds) / float(mask.shape[0] * mask.shape[1])
+                if coverage <= config.SCAN_MAX_BOUNDS_COVERAGE:
+                    fallback = (
+                        bounds / scale,
+                        "bounds",
+                        f"[{source_name}] bounding box (cover={coverage:.2f})",
+                    )
+                else:
+                    fallback = (
+                        None,  # type: ignore[arg-type]
+                        "none",
+                        f"[{source_name}] document fills the frame; nothing to crop",
+                    )
+
+    if fallback is not None:
+        return fallback
 
     return None, "none", "no document found"
 
@@ -689,7 +745,7 @@ def scan_array_detailed(
 
     geometry = bgr
     if opts.auto_crop:
-        quad, kind, detail = _detect(bgr)
+        quad, kind, detail = _detect(bgr, opts.use_ai)
         report.crop_kind = kind
         report.detail = detail
         if quad is not None:
@@ -804,6 +860,24 @@ def scan_file_detailed(
         _array_to_pil(enhanced),
         report,
     )
+
+
+def detect_quad_in_image(image: Image.Image) -> list[tuple[float, float]] | None:
+    """Corners of the page in a PIL image, as plain (x, y) pairs, or None."""
+    _require_cv2()
+    quad = find_document_quad(_pil_to_bgr(image))
+    if quad is None:
+        return None
+    return [(float(x), float(y)) for x, y in quad]
+
+
+def crop_image_to_quad(
+    image: Image.Image, quad: list[tuple[float, float]]
+) -> Image.Image:
+    """Warp the four corners (tl, tr, br, bl) of a PIL image to a head-on rectangle."""
+    _require_cv2()
+    points = np.array(quad, dtype=np.float32)
+    return _array_to_pil(four_point_transform(_pil_to_bgr(image), points))
 
 
 def _cli() -> int:

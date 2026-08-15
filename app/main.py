@@ -15,21 +15,26 @@ import customtkinter as ctk
 from app import config
 from app.converter import (
     CropPreviewResult,
-    collect_images_from_folder,
+    collect_sources_from_folder,
     convert_images_to_pdfs,
     export_crop_previews,
-    infer_source_output_dir,
     is_image_path,
+    is_pdf_path,
+    is_supported_path,
+    resolve_output_dir,
     sort_by_created,
 )
+from app.crop_tab import ScannerTab
+from app.pdf_pages import is_available as pdf_reader_available
 from app.scanner import SCAN_MODES, ScanOptions, is_available as scanner_available
+from app.ai_detector import is_model_available as ai_model_available
 
 
 _IMAGE_FILETYPES = [
     (
-        "Images",
-        "*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff "
-        "*.JPG *.JPEG *.PNG *.WEBP *.BMP *.TIF *.TIFF",
+        "Images and PDFs",
+        "*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff *.pdf "
+        "*.JPG *.JPEG *.PNG *.WEBP *.BMP *.TIF *.TIFF *.PDF",
     ),
     ("All files", "*.*"),
 ]
@@ -45,17 +50,36 @@ class Img2PdfApp(ctk.CTk):
         ctk.set_appearance_mode("System")
         ctk.set_default_color_theme("blue")
 
-        self._image_paths: list[Path] = []
+        self._source_paths: list[Path] = []
         self._converting = False
 
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _build_ui(self) -> None:
+        """Top-level tabs. Each tab owns one feature; new ones just call ``add``."""
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-        toolbar = ctk.CTkFrame(self)
+        self._tabs = ctk.CTkTabview(self)
+        self._tabs.grid(row=0, column=0, sticky="nsew", padx=8, pady=8)
+
+        convert_tab = self._tabs.add("Convert to PDF")
+        scanner_tab = self._tabs.add("Scanner")
+
+        self._build_convert_tab(convert_tab)
+
+        scanner_tab.grid_columnconfigure(0, weight=1)
+        scanner_tab.grid_rowconfigure(0, weight=1)
+        ScannerTab(scanner_tab).grid(row=0, column=0, sticky="nsew")
+
+        self._tabs.set("Convert to PDF")
+
+    def _build_convert_tab(self, parent: ctk.CTkFrame) -> None:
+        parent.grid_columnconfigure(0, weight=1)
+        parent.grid_rowconfigure(1, weight=1)
+
+        toolbar = ctk.CTkFrame(parent)
         toolbar.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
         toolbar.grid_columnconfigure(5, weight=1)
 
@@ -75,13 +99,13 @@ class Img2PdfApp(ctk.CTk):
             row=0, column=4, padx=(0, 8), pady=8
         )
 
-        list_frame = ctk.CTkFrame(self)
+        list_frame = ctk.CTkFrame(parent)
         list_frame.grid(row=1, column=0, sticky="nsew", padx=12, pady=6)
         list_frame.grid_columnconfigure(0, weight=1)
         list_frame.grid_rowconfigure(1, weight=1)
 
         self._count_label = ctk.CTkLabel(
-            list_frame, text="0 image(s) selected (sorted by date created)"
+            list_frame, text="0 file(s) selected (sorted by date created)"
         )
         self._count_label.grid(row=0, column=0, sticky="w", padx=8, pady=(8, 4))
 
@@ -98,11 +122,11 @@ class Img2PdfApp(ctk.CTk):
         scrollbar.grid(row=1, column=1, sticky="ns", padx=(0, 8), pady=(0, 8))
         self._listbox.configure(yscrollcommand=scrollbar.set)
 
-        settings = ctk.CTkFrame(self)
+        settings = ctk.CTkFrame(parent)
         settings.grid(row=2, column=0, sticky="ew", padx=12, pady=6)
         settings.grid_columnconfigure(1, weight=1)
 
-        ctk.CTkLabel(settings, text="Max images / PDF").grid(
+        ctk.CTkLabel(settings, text="Max pages / PDF").grid(
             row=0, column=0, sticky="w", padx=8, pady=(8, 4)
         )
         self._max_images_entry = ctk.CTkEntry(settings, width=80)
@@ -134,12 +158,22 @@ class Img2PdfApp(ctk.CTk):
         self._scan_mode_menu.set(config.DEFAULT_SCAN_MODE)
         self._scan_mode_menu.grid(row=0, column=1, sticky="w", padx=8)
 
+        self._ai_var = ctk.BooleanVar(value=config.DEFAULT_SCAN_USE_AI)
+        self._ai_check = ctk.CTkCheckBox(
+            scan_row,
+            text="AI detection",
+            variable=self._ai_var,
+            command=self._on_scan_toggled,
+        )
+        self._ai_check.grid(row=0, column=2, sticky="w", padx=8)
+
         self._scan_hint = ctk.CTkLabel(scan_row, text="", anchor="w", justify="left")
-        self._scan_hint.grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 0))
+        self._scan_hint.grid(row=1, column=0, columnspan=3, sticky="w", padx=4, pady=(2, 0))
 
         if not scanner_available():
             self._scan_var.set(False)
             self._scan_check.configure(state="disabled")
+            self._ai_check.configure(state="disabled")
             self._scan_hint.configure(
                 text="Scanning needs OpenCV — install with: "
                 "pip install opencv-python-headless numpy"
@@ -151,7 +185,7 @@ class Img2PdfApp(ctk.CTk):
         )
         self._output_label = ctk.CTkLabel(
             settings,
-            text="(same as source folder)",
+            text=f"(a '{config.OUTPUT_DIR_NAME}' folder inside the source folder)",
             anchor="w",
             justify="left",
         )
@@ -159,12 +193,12 @@ class Img2PdfApp(ctk.CTk):
             row=3, column=1, columnspan=2, sticky="ew", padx=8, pady=(4, 8)
         )
 
-        bottom = ctk.CTkFrame(self)
+        bottom = ctk.CTkFrame(parent)
         bottom.grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 12))
         bottom.grid_columnconfigure(0, weight=1)
 
         self._status_label = ctk.CTkLabel(
-            bottom, text="Ready. Choose a file, multiple files, or a folder.", anchor="w"
+            bottom, text="Ready. Choose images or PDFs, or a whole folder.", anchor="w"
         )
         self._status_label.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
 
@@ -190,64 +224,93 @@ class Img2PdfApp(ctk.CTk):
     def _on_scan_toggled(self) -> None:
         enabled = bool(self._scan_var.get())
         self._scan_mode_menu.configure(state="normal" if enabled else "disabled")
+        self._ai_check.configure(state="normal" if enabled else "disabled")
         if not scanner_available():
             return
-        self._scan_hint.configure(
-            text=(
-                "auto = colour pages stay colour, text pages go black & white."
-                if enabled
-                else "Off: photos are packed into the PDF exactly as shot."
+        if not enabled:
+            self._scan_hint.configure(
+                text="Off: photos are packed into the PDF exactly as shot."
             )
+            return
+        if not self._ai_var.get():
+            detector = "Classical detection (no model needed)."
+        elif ai_model_available():
+            detector = "AI detection, falling back to the classical one when unsure."
+        else:
+            detector = "AI model downloads once (4.6 MB) on first use."
+        self._scan_hint.configure(
+            text=f"auto = colour unless the page is plain ink on paper. {detector}"
         )
 
     def _scan_options(self) -> ScanOptions:
         return ScanOptions(
             enabled=bool(self._scan_var.get()),
             mode=self._scan_mode_menu.get(),
+            use_ai=bool(self._ai_var.get()),
         )
 
     def _set_status(self, message: str) -> None:
         self._status_label.configure(text=message)
 
     def _update_output_label(self) -> None:
-        if not self._image_paths:
-            self._output_label.configure(text="(same as source folder)")
+        if not self._source_paths:
+            self._output_label.configure(
+                text=f"(a '{config.OUTPUT_DIR_NAME}' folder inside the source folder)"
+            )
             return
-        out_dir = infer_source_output_dir(self._image_paths)
-        self._output_label.configure(text=str(out_dir))
+        self._output_label.configure(text=str(resolve_output_dir(self._source_paths)))
 
     def _refresh_list(self) -> None:
-        self._image_paths = sort_by_created(self._image_paths)
+        self._source_paths = sort_by_created(self._source_paths)
         self._listbox.delete(0, tk.END)
-        for path in self._image_paths:
+        for path in self._source_paths:
             self._listbox.insert(tk.END, str(path))
+        pdf_count = sum(1 for path in self._source_paths if is_pdf_path(path))
+        suffix = f", {pdf_count} PDF(s)" if pdf_count else ""
         self._count_label.configure(
-            text=f"{len(self._image_paths)} image(s) selected (sorted by date created)"
+            text=(
+                f"{len(self._source_paths)} file(s) selected{suffix} "
+                "(sorted by date created)"
+            )
         )
         self._update_output_label()
 
     def _add_paths(self, paths: list[Path], *, replace: bool = False) -> None:
         if replace:
-            self._image_paths = []
+            self._source_paths = []
 
-        existing = set(self._image_paths)
+        existing = set(self._source_paths)
         added = 0
+        skipped_pdf = 0
         for path in paths:
             resolved = path.expanduser().resolve()
-            if resolved in existing or not is_image_path(resolved):
+            if resolved in existing or not is_supported_path(resolved):
                 continue
-            self._image_paths.append(resolved)
+            if is_pdf_path(resolved) and not pdf_reader_available():
+                skipped_pdf += 1
+                continue
+            self._source_paths.append(resolved)
             existing.add(resolved)
             added += 1
         self._refresh_list()
+
+        if skipped_pdf:
+            messagebox.showwarning(
+                "PDFs skipped",
+                f"{skipped_pdf} PDF file(s) were skipped because pypdfium2 is not "
+                "installed. Install it with:\n\n    pip install pypdfium2",
+            )
         if added:
-            self._set_status(f"Added {added} image(s). PDF will be saved in the source folder.")
+            self._set_status(
+                f"Added {added} file(s). PDF will be saved in "
+                f"the '{config.OUTPUT_DIR_NAME}' folder."
+            )
         else:
-            self._set_status("No new images added.")
+            self._set_status("No new files added.")
 
     def _add_file(self) -> None:
         selected = filedialog.askopenfilename(
-            title="Select an image file",
+            title="Select an image or PDF file",
             filetypes=_IMAGE_FILETYPES,
         )
         if selected:
@@ -255,30 +318,30 @@ class Img2PdfApp(ctk.CTk):
 
     def _add_files(self) -> None:
         selected = filedialog.askopenfilenames(
-            title="Select image files",
+            title="Select image or PDF files",
             filetypes=_IMAGE_FILETYPES,
         )
         if selected:
             self._add_paths([Path(p) for p in selected])
 
     def _add_folder(self) -> None:
-        folder = filedialog.askdirectory(title="Select folder with images")
+        folder = filedialog.askdirectory(title="Select folder with images / PDFs")
         if not folder:
             return
         folder_path = Path(folder)
-        images = collect_images_from_folder(folder_path)
-        if not images:
+        sources = collect_sources_from_folder(folder_path)
+        if not sources:
             messagebox.showinfo(
-                "No images",
-                "No image files found in that folder "
-                f"(extensions: {', '.join(sorted(config.IMAGE_EXTENSIONS))}).",
+                "Nothing found",
+                "No image or PDF files found in that folder "
+                f"(extensions: {', '.join(sorted(config.SUPPORTED_EXTENSIONS))}).",
             )
             return
         # Whole-folder selection replaces the list and uses that folder as source.
-        self._add_paths(images, replace=True)
+        self._add_paths(sources, replace=True)
         self._set_status(
-            f"Loaded {len(images)} image(s) from folder. "
-            f"PDF will be saved in: {folder_path.resolve()}"
+            f"Loaded {len(self._source_paths)} file(s) from folder. "
+            f"PDF will be saved in: {folder_path.resolve() / config.OUTPUT_DIR_NAME}"
         )
 
     def _remove_selected(self) -> None:
@@ -286,12 +349,12 @@ class Img2PdfApp(ctk.CTk):
         if not selection:
             return
         for index in reversed(selection):
-            del self._image_paths[index]
+            del self._source_paths[index]
         self._refresh_list()
-        self._set_status("Removed selected image(s).")
+        self._set_status("Removed selected file(s).")
 
     def _clear_list(self) -> None:
-        self._image_paths.clear()
+        self._source_paths.clear()
         self._refresh_list()
         self._set_status("Cleared selection.")
 
@@ -299,9 +362,9 @@ class Img2PdfApp(ctk.CTk):
         try:
             max_images = int(self._max_images_entry.get().strip())
         except ValueError as exc:
-            raise ValueError("Max images / PDF must be a whole number.") from exc
+            raise ValueError("Max pages / PDF must be a whole number.") from exc
         if max_images < 1:
-            raise ValueError("Max images / PDF must be at least 1.")
+            raise ValueError("Max pages / PDF must be at least 1.")
 
         try:
             max_size_mb = float(self._max_size_entry.get().strip())
@@ -323,10 +386,14 @@ class Img2PdfApp(ctk.CTk):
         """Scan the selected images into a temp_crop folder, without making a PDF."""
         if self._converting:
             return
-        if not self._image_paths:
+        # The preview is about boundary detection on photos, so PDF pages
+        # (already flat) are left out of it.
+        images = [path for path in self._source_paths if is_image_path(path)]
+        if not images:
             messagebox.showwarning(
                 "No images",
-                "Choose a file, multiple files, or a folder first.",
+                "Choose at least one image file first "
+                "(the crop preview does not apply to PDF pages).",
             )
             return
 
@@ -334,7 +401,7 @@ class Img2PdfApp(ctk.CTk):
         self._set_status("Starting crop preview...")
         thread = threading.Thread(
             target=self._crop_worker,
-            args=(list(self._image_paths), self._scan_options()),
+            args=(images, self._scan_options()),
             daemon=True,
         )
         thread.start()
@@ -379,9 +446,9 @@ class Img2PdfApp(ctk.CTk):
     def _start_convert(self) -> None:
         if self._converting:
             return
-        if not self._image_paths:
+        if not self._source_paths:
             messagebox.showwarning(
-                "No images",
+                "Nothing selected",
                 "Choose a file, multiple files, or a folder first.",
             )
             return
@@ -392,14 +459,14 @@ class Img2PdfApp(ctk.CTk):
             messagebox.showerror("Invalid settings", str(exc))
             return
 
-        output_dir = infer_source_output_dir(self._image_paths)
+        output_dir = resolve_output_dir(self._source_paths)
         self._set_busy(True)
         self._set_status(f"Starting conversion → {output_dir}")
 
         thread = threading.Thread(
             target=self._convert_worker,
             args=(
-                list(self._image_paths),
+                list(self._source_paths),
                 output_dir,
                 max_images,
                 max_size_mb,
@@ -441,7 +508,10 @@ class Img2PdfApp(ctk.CTk):
     ) -> None:
         self._set_busy(False)
 
-        summary = f"Created {len(output_paths)} PDF(s) in the source folder."
+        summary = (
+            f"Created {len(output_paths)} PDF(s) in the "
+            f"'{config.OUTPUT_DIR_NAME}' folder."
+        )
         if warnings:
             summary += f" {len(warnings)} warning(s)."
         self._set_status(summary)
