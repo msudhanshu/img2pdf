@@ -14,12 +14,15 @@ import customtkinter as ctk
 
 from app import config
 from app.converter import (
+    CropPreviewResult,
     collect_images_from_folder,
     convert_images_to_pdfs,
+    export_crop_previews,
     infer_source_output_dir,
     is_image_path,
     sort_by_created,
 )
+from app.scanner import SCAN_MODES, ScanOptions, is_available as scanner_available
 
 
 _IMAGE_FILETYPES = [
@@ -113,8 +116,38 @@ class Img2PdfApp(ctk.CTk):
         self._max_size_entry.insert(0, str(config.DEFAULT_MAX_PDF_SIZE_MB))
         self._max_size_entry.grid(row=1, column=1, sticky="w", padx=8, pady=4)
 
+        scan_row = ctk.CTkFrame(settings, fg_color="transparent")
+        scan_row.grid(row=2, column=0, columnspan=3, sticky="ew", padx=4, pady=4)
+
+        self._scan_var = ctk.BooleanVar(value=config.DEFAULT_SCAN_ENABLED)
+        self._scan_check = ctk.CTkCheckBox(
+            scan_row,
+            text="Scan documents (auto-crop, deskew, clean up)",
+            variable=self._scan_var,
+            command=self._on_scan_toggled,
+        )
+        self._scan_check.grid(row=0, column=0, sticky="w", padx=4)
+
+        self._scan_mode_menu = ctk.CTkOptionMenu(
+            scan_row, values=list(SCAN_MODES), width=110
+        )
+        self._scan_mode_menu.set(config.DEFAULT_SCAN_MODE)
+        self._scan_mode_menu.grid(row=0, column=1, sticky="w", padx=8)
+
+        self._scan_hint = ctk.CTkLabel(scan_row, text="", anchor="w", justify="left")
+        self._scan_hint.grid(row=1, column=0, columnspan=2, sticky="w", padx=4, pady=(2, 0))
+
+        if not scanner_available():
+            self._scan_var.set(False)
+            self._scan_check.configure(state="disabled")
+            self._scan_hint.configure(
+                text="Scanning needs OpenCV — install with: "
+                "pip install opencv-python-headless numpy"
+            )
+        self._on_scan_toggled()
+
         ctk.CTkLabel(settings, text="Output folder").grid(
-            row=2, column=0, sticky="w", padx=8, pady=(4, 8)
+            row=3, column=0, sticky="w", padx=8, pady=(4, 8)
         )
         self._output_label = ctk.CTkLabel(
             settings,
@@ -123,7 +156,7 @@ class Img2PdfApp(ctk.CTk):
             justify="left",
         )
         self._output_label.grid(
-            row=2, column=1, columnspan=2, sticky="ew", padx=8, pady=(4, 8)
+            row=3, column=1, columnspan=2, sticky="ew", padx=8, pady=(4, 8)
         )
 
         bottom = ctk.CTkFrame(self)
@@ -135,10 +168,43 @@ class Img2PdfApp(ctk.CTk):
         )
         self._status_label.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
 
-        self._convert_btn = ctk.CTkButton(
-            bottom, text="Convert", command=self._start_convert
+        buttons = ctk.CTkFrame(bottom, fg_color="transparent")
+        buttons.grid(row=1, column=0, sticky="e", padx=8, pady=(4, 8))
+
+        self._crop_btn = ctk.CTkButton(
+            buttons,
+            text="Crop preview",
+            command=self._start_crop_preview,
+            fg_color="transparent",
+            border_width=1,
         )
-        self._convert_btn.grid(row=1, column=0, sticky="e", padx=8, pady=(4, 8))
+        self._crop_btn.grid(row=0, column=0, padx=(0, 8))
+        if not scanner_available():
+            self._crop_btn.configure(state="disabled")
+
+        self._convert_btn = ctk.CTkButton(
+            buttons, text="Convert", command=self._start_convert
+        )
+        self._convert_btn.grid(row=0, column=1)
+
+    def _on_scan_toggled(self) -> None:
+        enabled = bool(self._scan_var.get())
+        self._scan_mode_menu.configure(state="normal" if enabled else "disabled")
+        if not scanner_available():
+            return
+        self._scan_hint.configure(
+            text=(
+                "auto = colour pages stay colour, text pages go black & white."
+                if enabled
+                else "Off: photos are packed into the PDF exactly as shot."
+            )
+        )
+
+    def _scan_options(self) -> ScanOptions:
+        return ScanOptions(
+            enabled=bool(self._scan_var.get()),
+            mode=self._scan_mode_menu.get(),
+        )
 
     def _set_status(self, message: str) -> None:
         self._status_label.configure(text=message)
@@ -246,6 +312,70 @@ class Img2PdfApp(ctk.CTk):
 
         return max_images, max_size_mb
 
+    def _set_busy(self, busy: bool) -> None:
+        self._converting = busy
+        state = "disabled" if busy else "normal"
+        self._convert_btn.configure(state=state)
+        if scanner_available():
+            self._crop_btn.configure(state=state)
+
+    def _start_crop_preview(self) -> None:
+        """Scan the selected images into a temp_crop folder, without making a PDF."""
+        if self._converting:
+            return
+        if not self._image_paths:
+            messagebox.showwarning(
+                "No images",
+                "Choose a file, multiple files, or a folder first.",
+            )
+            return
+
+        self._set_busy(True)
+        self._set_status("Starting crop preview...")
+        thread = threading.Thread(
+            target=self._crop_worker,
+            args=(list(self._image_paths), self._scan_options()),
+            daemon=True,
+        )
+        thread.start()
+
+    def _crop_worker(self, image_paths: list[Path], scan_options: ScanOptions) -> None:
+        try:
+            result = export_crop_previews(
+                image_paths=image_paths,
+                scan_options=scan_options,
+                progress=lambda msg: self.after(0, self._set_status, msg),
+            )
+        except Exception as exc:  # noqa: BLE001 - show any failure in the UI
+            self.after(0, self._on_crop_failed, str(exc))
+            return
+        self.after(0, self._on_crop_finished, result)
+
+    def _on_crop_failed(self, error: str) -> None:
+        self._set_busy(False)
+        self._set_status("Crop preview failed.")
+        messagebox.showerror("Crop preview failed", error)
+
+    def _on_crop_finished(self, result: CropPreviewResult) -> None:
+        self._set_busy(False)
+        summary = (
+            f"{result.cropped_count} of {result.image_count} image(s) auto-cropped."
+        )
+        self._set_status(f"Crop preview done. {summary}")
+
+        detail = (
+            f"{summary}\n\nWritten to:\n{result.output_dir}\n\n"
+            "Per photo:\n"
+            "  *_1_outline.jpg  detected page outline on the original\n"
+            "  *_2_crop.jpg     cropped + deskewed, no clean-up\n"
+            "  *_3_scan.jpg     final scanned look"
+        )
+        if result.warnings:
+            detail += "\n\nWarnings:\n" + "\n".join(result.warnings[:10])
+        messagebox.showinfo("Crop preview complete", detail)
+        if result.output_dir:
+            self._open_folder(result.output_dir)
+
     def _start_convert(self) -> None:
         if self._converting:
             return
@@ -263,13 +393,18 @@ class Img2PdfApp(ctk.CTk):
             return
 
         output_dir = infer_source_output_dir(self._image_paths)
-        self._converting = True
-        self._convert_btn.configure(state="disabled")
+        self._set_busy(True)
         self._set_status(f"Starting conversion → {output_dir}")
 
         thread = threading.Thread(
             target=self._convert_worker,
-            args=(list(self._image_paths), output_dir, max_images, max_size_mb),
+            args=(
+                list(self._image_paths),
+                output_dir,
+                max_images,
+                max_size_mb,
+                self._scan_options(),
+            ),
             daemon=True,
         )
         thread.start()
@@ -280,6 +415,7 @@ class Img2PdfApp(ctk.CTk):
         output_dir: Path,
         max_images: int,
         max_size_mb: float,
+        scan_options: ScanOptions,
     ) -> None:
         try:
             result = convert_images_to_pdfs(
@@ -288,6 +424,7 @@ class Img2PdfApp(ctk.CTk):
                 max_images_per_pdf=max_images,
                 max_pdf_size_mb=max_size_mb,
                 progress=lambda msg: self.after(0, self._set_status, msg),
+                scan_options=scan_options,
             )
         except Exception as exc:  # noqa: BLE001 - show any conversion failure in UI
             self.after(0, self._on_convert_failed, str(exc))
@@ -295,16 +432,14 @@ class Img2PdfApp(ctk.CTk):
         self.after(0, self._on_convert_finished, result.output_paths, result.warnings)
 
     def _on_convert_failed(self, error: str) -> None:
-        self._converting = False
-        self._convert_btn.configure(state="normal")
+        self._set_busy(False)
         self._set_status("Conversion failed.")
         messagebox.showerror("Conversion failed", error)
 
     def _on_convert_finished(
         self, output_paths: list[Path], warnings: list[str]
     ) -> None:
-        self._converting = False
-        self._convert_btn.configure(state="normal")
+        self._set_busy(False)
 
         summary = f"Created {len(output_paths)} PDF(s) in the source folder."
         if warnings:

@@ -6,7 +6,9 @@ from PyInstaller.utils.hooks import collect_all
 
 datas = []
 binaries = []
-hiddenimports = ["PIL._tkinter_finder"]
+# cv2/numpy back the document scanner; PyInstaller's bundled hooks pull in their
+# binaries, they just need to be named because the import is inside a try block.
+hiddenimports = ["PIL._tkinter_finder", "cv2", "numpy"]
 
 tmp_ret = collect_all("customtkinter")
 datas += tmp_ret[0]

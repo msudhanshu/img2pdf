@@ -1,16 +1,18 @@
-"""Chunk images into PDFs with size-aware resize retries."""
+"""Chunk images into PDFs with compression, then fewer pages if needed."""
 
 from __future__ import annotations
 
-import io
+import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterator
 
 import img2pdf
-from PIL import Image
 
 from app import config
+from app.compression import ImageCompressor, default_compressor
+from app.scanner import ScanOptions, scan_file, scan_file_detailed
 
 ProgressCallback = Callable[[str], None]
 
@@ -78,124 +80,155 @@ def chunk_paths(paths: list[Path], max_images: int) -> list[list[Path]]:
         raise ValueError("max_images must be at least 1")
     return [paths[i : i + max_images] for i in range(0, len(paths), max_images)]
 
-def _to_rgb(image: Image.Image) -> Image.Image:
-    if image.mode in ("RGB", "L"):
-        return image.convert("RGB")
-    if image.mode in ("RGBA", "LA") or (
-        image.mode == "P" and "transparency" in image.info
-    ):
-        rgba = image.convert("RGBA")
-        background = Image.new("RGB", rgba.size, (255, 255, 255))
-        background.paste(rgba, mask=rgba.split()[-1])
-        return background
-    return image.convert("RGB")
 
-
-def _encode_jpeg(image: Image.Image, quality: int) -> bytes:
-    buffer = io.BytesIO()
-    image.save(buffer, format="JPEG", quality=quality, optimize=True)
-    return buffer.getvalue()
-
-
-def _prepare_jpeg_pages(
+def _compressed_pages(
     image_paths: list[Path],
-    scale: float,
-    quality: int,
+    compressor: ImageCompressor,
 ) -> list[bytes]:
-    pages: list[bytes] = []
-    for path in image_paths:
-        with Image.open(path) as img:
-            rgb = _to_rgb(img)
-            if scale < 1.0:
-                width = max(1, int(rgb.width * scale))
-                height = max(1, int(rgb.height * scale))
-                rgb = rgb.resize((width, height), Image.Resampling.LANCZOS)
-            pages.append(_encode_jpeg(rgb, quality))
-    return pages
+    return [compressor.compress(path) for path in image_paths]
 
 
-def _build_pdf_bytes(jpeg_pages: list[bytes]) -> bytes:
-    return img2pdf.convert(jpeg_pages)
+@contextmanager
+def _scanned_sources(
+    paths: list[Path],
+    scan_options: ScanOptions | None,
+    report: ProgressCallback,
+) -> Iterator[list[Path]]:
+    """
+    Yield paths to scanned copies of ``paths`` (auto-cropped, deskewed, cleaned).
+
+    Scanning is done once up front and cached in a temp folder, because the
+    compression loop re-encodes the same page many times. Order is preserved,
+    and any page that fails to scan falls back to its original file.
+    """
+    if scan_options is None or not scan_options.enabled:
+        yield paths
+        return
+
+    with tempfile.TemporaryDirectory(prefix="img2pdf_scan_") as temp_dir:
+        scan_dir = Path(temp_dir)
+        scanned: list[Path] = []
+        for index, path in enumerate(paths, start=1):
+            report(f"Scanning {path.name} ({index}/{len(paths)})...")
+            try:
+                page = scan_file(path, scan_options)
+            except Exception as exc:  # noqa: BLE001 - one bad page must not fail the run
+                report(f"Could not scan {path.name} ({exc}); using the original.")
+                scanned.append(path)
+                continue
+
+            # Bitonal pages go through PNG so the temp copy adds no JPEG ringing.
+            bitonal = page.mode == "L" and (page.getcolors(maxcolors=4) is not None)
+            if bitonal:
+                destination = scan_dir / f"{index:04d}.png"
+                page.save(destination, format="PNG", optimize=True)
+            else:
+                destination = scan_dir / f"{index:04d}.jpg"
+                page.save(
+                    destination,
+                    format="JPEG",
+                    quality=config.SCAN_INTERMEDIATE_JPEG_QUALITY,
+                    subsampling=0,
+                )
+            scanned.append(destination)
+        yield scanned
 
 
-def _min_scale_for_paths(image_paths: list[Path]) -> float:
-    """Scale floor so the longest edge stays at or above MIN_LONG_EDGE_PX when possible."""
-    max_long_edge = 0
-    for path in image_paths:
-        with Image.open(path) as img:
-            max_long_edge = max(max_long_edge, max(img.size))
-    if max_long_edge <= 0:
-        return config.INITIAL_SCALE
-    if max_long_edge <= config.MIN_LONG_EDGE_PX:
-        return config.INITIAL_SCALE
-    return config.MIN_LONG_EDGE_PX / max_long_edge
+@dataclass
+class CropPreviewResult:
+    """Outcome of a crop-preview run (no PDFs written)."""
+
+    output_dir: Path | None = None
+    output_paths: list[Path] = field(default_factory=list)
+    image_count: int = 0
+    cropped_count: int = 0
+    warnings: list[str] = field(default_factory=list)
 
 
-def convert_chunk_to_pdf(
-    image_paths: list[Path],
-    output_path: Path,
-    max_bytes: int,
+def export_crop_previews(
+    image_paths: list[Path | str],
+    output_dir: Path | str | None = None,
+    scan_options: ScanOptions | None = None,
     progress: ProgressCallback | None = None,
-) -> str | None:
+) -> CropPreviewResult:
     """
-    Write one PDF for the given images, resizing in a loop until under max_bytes.
+    Write scan results to a ``temp_crop`` folder so the crop can be checked by eye.
 
-    Returns a warning string if the size floor was hit while still over limit, else None.
+    Three files per photo, no PDF involved:
+
+    * ``<name>_1_outline.jpg`` – the original with the detected page outline drawn
+    * ``<name>_2_crop.jpg``    – cropped and deskewed, original pixels otherwise
+    * ``<name>_3_scan.jpg``    – the final cleaned-up page as it would enter the PDF
     """
-    if not image_paths:
-        raise ValueError("image_paths must not be empty")
+    paths = normalize_image_paths(list(image_paths))
+    if not paths:
+        raise ValueError("No valid image files selected.")
+
+    options = scan_options or ScanOptions()
+    options = ScanOptions(
+        enabled=True,  # the preview always scans, whatever the checkbox says
+        mode=options.mode,
+        auto_crop=options.auto_crop,
+        deskew=options.deskew,
+        sharpen=options.sharpen,
+    )
+
+    if output_dir is None:
+        out_dir = infer_source_output_dir(paths) / config.SCAN_PREVIEW_DIR_NAME
+    else:
+        out_dir = Path(output_dir).expanduser().resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    result = CropPreviewResult(output_dir=out_dir, image_count=len(paths))
 
     def report(message: str) -> None:
         if progress:
             progress(message)
 
-    scale = config.INITIAL_SCALE
-    quality = config.INITIAL_JPEG_QUALITY
-    min_scale = _min_scale_for_paths(image_paths)
-    warning: str | None = None
-    attempt = 0
+    report(f"Writing crop previews for {len(paths)} image(s) → {out_dir}")
 
-    while True:
-        attempt += 1
-        report(
-            f"Building {output_path.name} (attempt {attempt}, "
-            f"scale={scale:.2f}, quality={quality})..."
-        )
-        jpeg_pages = _prepare_jpeg_pages(image_paths, scale, quality)
-        pdf_bytes = _build_pdf_bytes(jpeg_pages)
+    for index, path in enumerate(paths, start=1):
+        report(f"Cropping {path.name} ({index}/{len(paths)})...")
+        try:
+            outline, geometry, enhanced, scan_report = scan_file_detailed(path, options)
+        except Exception as exc:  # noqa: BLE001 - one bad page must not fail the run
+            warning = f"Could not scan {path.name}: {exc}"
+            report(warning)
+            result.warnings.append(warning)
+            continue
 
-        if len(pdf_bytes) <= max_bytes:
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_bytes(pdf_bytes)
-            report(
-                f"Saved {output_path.name} "
-                f"({len(pdf_bytes) / (1024 * 1024):.2f} MB)"
+        stem = f"{index:02d}_{path.stem}"
+        for suffix, image in (
+            ("1_outline", outline),
+            ("2_crop", geometry),
+            ("3_scan", enhanced),
+        ):
+            destination = out_dir / f"{stem}_{suffix}.jpg"
+            image.convert("L" if image.mode == "L" else "RGB").save(
+                destination, format="JPEG", quality=92
             )
-            return warning
+            result.output_paths.append(destination)
 
-        can_drop_quality = quality - config.QUALITY_STEP >= config.MIN_JPEG_QUALITY
-        next_scale = scale * config.SCALE_FACTOR
-        can_scale = next_scale >= min_scale - 1e-9
+        if scan_report.cropped:
+            result.cropped_count += 1
+        else:
+            warning = f"No page boundary found in {path.name} (kept the full frame)."
+            report(warning)
+            result.warnings.append(warning)
 
-        if can_drop_quality:
-            quality -= config.QUALITY_STEP
-            continue
-        if can_scale:
-            scale = next_scale
-            quality = config.INITIAL_JPEG_QUALITY
-            continue
+    report(
+        f"Crop preview done: {result.cropped_count}/{len(paths)} auto-cropped → {out_dir}"
+    )
+    return result
 
-        # Floors reached; save best effort and warn.
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(pdf_bytes)
-        size_mb = len(pdf_bytes) / (1024 * 1024)
-        limit_mb = max_bytes / (1024 * 1024)
-        warning = (
-            f"{output_path.name} is {size_mb:.2f} MB "
-            f"(over {limit_mb:.2f} MB limit) after minimum resize/quality."
-        )
-        report(warning)
-        return warning
+
+def _build_pdf_bytes(pages: list[bytes]) -> bytes:
+    return img2pdf.convert(pages)
+
+
+def _write_pdf(output_path: Path, pdf_bytes: bytes) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(pdf_bytes)
 
 
 def convert_images_to_pdfs(
@@ -204,12 +237,18 @@ def convert_images_to_pdfs(
     max_images_per_pdf: int = config.DEFAULT_MAX_IMAGES_PER_PDF,
     max_pdf_size_mb: float = config.DEFAULT_MAX_PDF_SIZE_MB,
     progress: ProgressCallback | None = None,
+    compressor: ImageCompressor | None = None,
+    scan_options: ScanOptions | None = None,
 ) -> ConvertResult:
     """
     Convert selected images into one or more size-capped PDFs.
 
-    Images are sorted by date created before grouping into chunks of
-    ``max_images_per_pdf``. PDFs are written into the source folder by default.
+    Images are sorted by date created. When ``scan_options`` is enabled each
+    photo is first auto-cropped to the document boundary, deskewed and cleaned
+    up to look scanned. Each PDF then starts with up to ``max_images_per_pdf``
+    pages. Compression is tried first (original dimensions kept). If the PDF is
+    still over the size limit at maximum compression, the last image is moved
+    to the next PDF and the loop repeats.
     """
     paths = normalize_image_paths(list(image_paths))
     if not paths:
@@ -223,31 +262,93 @@ def convert_images_to_pdfs(
     max_bytes = int(max_pdf_size_mb * 1024 * 1024)
     if max_bytes < 1:
         raise ValueError("max_pdf_size_mb must be positive.")
+    if max_images_per_pdf < 1:
+        raise ValueError("max_images_per_pdf must be at least 1.")
 
-    # Grouping order is creation date (already applied in normalize_image_paths).
-    chunks = chunk_paths(paths, max_images_per_pdf)
-    result = ConvertResult(image_count=len(paths), pdf_count=len(chunks))
+    compressor = compressor or default_compressor()
+    result = ConvertResult(image_count=len(paths))
 
     def report(message: str) -> None:
         if progress:
             progress(message)
 
     report(
-        f"Converting {len(paths)} image(s) into {len(chunks)} PDF(s) "
-        f"(grouped by date created) → {out_dir}"
+        f"Converting {len(paths)} image(s) (grouped by date created) → {out_dir}"
     )
 
-    for index, chunk in enumerate(chunks, start=1):
-        output_path = out_dir / config.OUTPUT_NAME_PATTERN.format(part=index)
-        warning = convert_chunk_to_pdf(
-            chunk,
-            output_path,
+    with _scanned_sources(paths, scan_options, report) as sources:
+        _pack_into_pdfs(
+            sources=sources,
+            out_dir=out_dir,
+            max_images_per_pdf=max_images_per_pdf,
             max_bytes=max_bytes,
-            progress=progress,
+            compressor=compressor,
+            report=report,
+            result=result,
         )
-        result.output_paths.append(output_path)
-        if warning:
-            result.warnings.append(warning)
 
+    result.pdf_count = len(result.output_paths)
     report("Done.")
     return result
+
+
+def _pack_into_pdfs(
+    sources: list[Path],
+    out_dir: Path,
+    max_images_per_pdf: int,
+    max_bytes: int,
+    compressor: ImageCompressor,
+    report: ProgressCallback,
+    result: ConvertResult,
+) -> None:
+    """Fill PDFs in order: compress harder first, then drop pages to the next PDF."""
+    remaining = list(sources)
+    part = 1
+
+    while remaining:
+        candidate_count = min(max_images_per_pdf, len(remaining))
+        compressor.reset()
+        output_path = out_dir / config.OUTPUT_NAME_PATTERN.format(part=part)
+
+        while True:
+            candidate = remaining[:candidate_count]
+            report(
+                f"Building {output_path.name} "
+                f"({len(candidate)} image(s), {compressor.label})..."
+            )
+            pdf_bytes = _build_pdf_bytes(_compressed_pages(candidate, compressor))
+            size_mb = len(pdf_bytes) / (1024 * 1024)
+
+            if len(pdf_bytes) <= max_bytes:
+                _write_pdf(output_path, pdf_bytes)
+                report(f"Saved {output_path.name} ({size_mb:.2f} MB)")
+                result.output_paths.append(output_path)
+                remaining = remaining[candidate_count:]
+                part += 1
+                break
+
+            if compressor.strengthen():
+                continue
+
+            if candidate_count > 1:
+                candidate_count -= 1
+                compressor.reset()
+                report(
+                    f"{output_path.name} still over limit after max compression; "
+                    f"trying {candidate_count} image(s)..."
+                )
+                continue
+
+            limit_mb = max_bytes / (1024 * 1024)
+            warning = (
+                f"{output_path.name} is {size_mb:.2f} MB "
+                f"(over {limit_mb:.2f} MB limit) after maximum compression "
+                f"of a single image."
+            )
+            _write_pdf(output_path, pdf_bytes)
+            report(warning)
+            result.output_paths.append(output_path)
+            result.warnings.append(warning)
+            remaining = remaining[1:]
+            part += 1
+            break
