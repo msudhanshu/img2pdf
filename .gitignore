@@ -6,4 +6,7 @@ dist/
 build/
 tmp_test_images/
 tmp_test_output/
+# Local test photos (may contain personal documents) and crop-preview output
+samples/
+temp_crop/
 .DS_Store
